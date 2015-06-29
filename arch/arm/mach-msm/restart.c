@@ -58,21 +58,25 @@ extern int get_partition_num_by_name(char *name);
 
 #endif
 
-#if defined(CONFIG_MACH_DUMMY)
+#ifdef CONFIG_KEXEC_HARDBOOT
+#include <asm/kexec.h>
+#endif
+
+#if defined(CONFIG_MACH_EYE_UL)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_EYE
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_EYE_WHL)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_EYE
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_EYE_WL)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_EYE
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_TL)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_MEC
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_WHL)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_MEC
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_UL)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_MEC
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_DUG)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_MEC
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_DWG)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_MEC
 #elif defined(CONFIG_MACH_DUMMY)
 #define PN547_I2C_POWEROFF_SEQUENCE_FOR_B2
@@ -615,6 +619,19 @@ static int __init msm_pmic_restart_init(void)
 
 late_initcall(msm_pmic_restart_init);
 
+#ifdef CONFIG_KEXEC_HARDBOOT
+static void msm_kexec_hardboot_hook(void)
+{
+	set_dload_mode(0);
+
+	// Set PMIC to restart-on-poweroff
+	pm8xxx_reset_pwr_off(1);
+
+	// These are executed on normal reboot, but with kexec-hardboot,
+	// they reboot/panic the system immediately.
+}
+#endif
+
 static int __init msm_restart_init(void)
 {
 	htc_restart_handler_init();
@@ -635,6 +652,10 @@ static int __init msm_restart_init(void)
 
 	if (scm_is_call_available(SCM_SVC_PWR, SCM_IO_DISABLE_PMIC_ARBITER) > 0)
 		scm_pmic_arbiter_disable_supported = true;
+
+#ifdef CONFIG_KEXEC_HARDBOOT
+	kexec_hardboot_hook = msm_kexec_hardboot_hook;
+#endif
 
 	return 0;
 }

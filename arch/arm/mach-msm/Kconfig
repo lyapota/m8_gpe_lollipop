@@ -1971,6 +1971,24 @@ config MSM_DEVFREQ_CPUBW
 	  agnostic interface to so that some of the devfreq governors can be
 	  shared across SoCs.
 
+config EXT_CMD_LINE
+	bool "Extended command line params"
+	default y
+	help
+	  This enables extended command line params.
+
+config EDP_LIMIT
+	bool "EDP limitation"
+	default y
+	help
+	  This enables EDP limitation.
+
+config MSM_CPU_VOLTAGE_CONTROL
+	bool "Userspace CPU Voltage Control"
+	default y
+	help
+	  This enables userspace CPU Voltage Control.
+
 config MSM_AVS_HW
 	bool "Enable Adaptive Voltage Scaling (AVS)"
 	default n
@@ -3078,6 +3096,13 @@ config MSM_CPU_PWRCTL
 	  stand alone power collapse operation. Selecting this option
 	  ensures that they are always off.
 
+config FORCE_FAST_CHARGE
+	bool "Increase input current limit to 1100mA when charging via USB"
+	default y
+	help
+	  A simple sysfs interface to increase input current limit to
+	  1100mA when charging via USB.
+
 config MSM_UARTDM_Core_v14
 	bool "Use MSM BLSP based HSUART Core v1.4"
 	depends on SERIAL_MSM_HS
@@ -3163,6 +3188,30 @@ config PROJECT_NAME
         default ""
         help
           Support for Project Name
+
+config MACH_M8_DTB
+        depends on ARCH_MSM8974
+        bool "MSM8974 M8"
+        help
+          Support for HTC MSM8974 M8
+
+config MACH_M8_WHL_DTB
+        depends on ARCH_MSM8974
+        bool "MSM8974 M8_WHL"
+        help
+          Support for HTC MSM8974 M8_WHL
+
+config MACH_M8_WL_DTB
+        depends on ARCH_MSM8974
+        bool "MSM8974 M8_WL"
+        help
+          Support for HTC MSM8974 M8_WL
+
+config MACH_M8_DUG_DTB
+        depends on ARCH_MSM8974
+        bool "MSM8974 M8_DUG"
+        help
+          Support for HTC MSM8974 M8_DUG
 
 endif
 

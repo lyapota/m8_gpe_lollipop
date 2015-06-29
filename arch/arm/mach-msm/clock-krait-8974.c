@@ -39,6 +39,59 @@
 #include <mach/perflock.h>
 #endif
 
+#ifdef CONFIG_EDP_LIMIT
+unsigned int edp_limit = 0;
+
+module_param(edp_limit, int, S_IRUGO | S_IWUSR);
+#endif
+
+#ifdef CONFIG_EXT_CMD_LINE
+unsigned long arg_cpu_oc = 0;
+static int arg_vdd_uv = 0;
+int pvs_number = 0;
+
+module_param_named(cpu_oc_current, arg_cpu_oc, long, S_IRUGO | S_IWUSR);
+module_param_named(vdd_uv_current, arg_vdd_uv, int, S_IRUGO);
+module_param(pvs_number, int, S_IRUGO);
+
+static int __init cpufreq_read_cpu_oc(char *cpu_oc)
+{
+	unsigned long ui_khz;
+	int err;
+
+	err =  strict_strtoul(cpu_oc, 0, &ui_khz);
+	if (err)
+		arg_cpu_oc = 0;
+	else
+		if (ui_khz >= 2265600 && ui_khz <= 2803200)
+			arg_cpu_oc = ui_khz;
+		else
+			arg_cpu_oc = 0;
+	printk("elementalx: cpu_oc=%lu kHz\n", arg_cpu_oc);
+	return 0;
+}
+__setup("cpu_oc=", cpufreq_read_cpu_oc);
+
+static int __init cpufreq_read_vdd_uv(char *vdd_uv)
+{
+	long ui_mv, err;
+
+	err =  strict_strtol(vdd_uv, 0, &ui_mv);
+	if (err)
+		arg_vdd_uv = 0;
+	else
+		if (abs(ui_mv) >= 1 && abs(ui_mv) <= 50)
+			arg_vdd_uv = ui_mv;
+		else
+			arg_vdd_uv = 0;
+
+	printk("elementalx: vdd_uv=%d mV\n", arg_vdd_uv);
+	return 0;
+}
+__setup("vdd_uv=", cpufreq_read_vdd_uv);
+
+#endif
+
 DEFINE_FIXED_DIV_CLK(hfpll_src_clk, 1, NULL);
 DEFINE_FIXED_DIV_CLK(acpu_aux_clk, 2, NULL);
 
@@ -472,6 +525,12 @@ static void get_krait_bin_format_b(struct platform_device *pdev,
 
 	
 	if (pte_efuse & BIT(3)) {
+#ifdef CONFIG_EXT_CMD_LINE
+		if (arg_cpu_oc == 0 && *speed == 1)
+			arg_cpu_oc = 2265600;
+		else if (arg_cpu_oc == 0 && *speed == 3)
+			arg_cpu_oc = 2457600;
+#endif		
 		dev_info(&pdev->dev, "Speed bin: %d\n", *speed);
 	} else {
 		dev_warn(&pdev->dev, "Speed bin not set. Defaulting to 0!\n");
@@ -481,6 +540,9 @@ static void get_krait_bin_format_b(struct platform_device *pdev,
 	
 	pte_efuse = readl_relaxed(base + 0x4) & BIT(21);
 	if (pte_efuse) {
+#ifdef CONFIG_EXT_CMD_LINE
+		pvs_number = *pvs;
+#endif		
 		dev_info(&pdev->dev, "PVS bin: %d\n", *pvs);
 	} else {
 		dev_warn(&pdev->dev, "PVS bin not set. Defaulting to 0!\n");
@@ -644,6 +706,11 @@ static void krait_update_uv(int *uv, int num, int boost_uv)
 	if (enable_boost) {
 		for (i = 0; i < num; i++)
 			uv[i] += boost_uv;
+#ifdef CONFIG_EXT_CMD_LINE
+        } else {
+		for (i = 0; i < num; i++)
+			uv[i] = uv[i] + (arg_vdd_uv * 1000);
+#endif
 	}
 }
 
@@ -651,6 +718,124 @@ static char table_name[] = "qcom,speedXX-pvsXX-bin-vXX";
 module_param_string(table_name, table_name, sizeof(table_name), S_IRUGO);
 static unsigned int pvs_config_ver;
 module_param(pvs_config_ver, uint, S_IRUGO);
+
+#ifdef CONFIG_MSM_CPU_VOLTAGE_CONTROL
+#define CPU_VDD_MAX	1200
+#define CPU_VDD_MIN	600
+
+extern int use_for_scaling(unsigned int freq);
+static unsigned int cnt;
+
+ssize_t show_UV_mV_table(struct cpufreq_policy *policy,
+			 char *buf)
+{
+	int i, freq, len = 0;
+	unsigned int cpu = 0;
+	unsigned int num_levels = cpu_clk[cpu]->vdd_class->num_levels;
+
+	if (!buf)
+		return -EINVAL;
+
+	for (i = 0; i < num_levels; i++) {
+		freq = use_for_scaling(cpu_clk[cpu]->fmax[i] / 1000);
+		if (freq < 0)
+			continue;
+
+		len += sprintf(buf + len, "%dmhz: %u mV\n", freq / 1000,
+			       cpu_clk[cpu]->vdd_class->vdd_uv[i] / 1000);
+	}
+
+	return len;
+}
+
+ssize_t store_UV_mV_table(struct cpufreq_policy *policy,
+			  char *buf, size_t count)
+{
+	int i, j;
+	int ret = 0;
+	unsigned int val, cpu = 0;
+	unsigned int num_levels = cpu_clk[cpu]->vdd_class->num_levels;
+	char size_cur[4];
+
+	if (cnt) {
+		cnt = 0;
+		return -EINVAL;
+	}
+
+	for (i = 0; i < num_levels; i++) {
+		if (use_for_scaling(cpu_clk[cpu]->fmax[i] / 1000) < 0)
+			continue;
+
+		ret = sscanf(buf, "%u", &val);
+		if (!ret)
+			return -EINVAL;
+
+		if (val > CPU_VDD_MAX)
+			val = CPU_VDD_MAX;
+		else if (val < CPU_VDD_MIN)
+			val = CPU_VDD_MIN;
+
+		for (j = 0; j < NR_CPUS; j++)
+			cpu_clk[j]->vdd_class->vdd_uv[i] = val * 1000;
+
+		ret = sscanf(buf, "%s", size_cur);
+		cnt = strlen(size_cur);
+		buf += cnt + 1;
+	}
+
+	return ret;
+}
+#endif
+
+#ifdef CONFIG_EXT_CMD_LINE
+static int quick_vdd_uv = 0;
+
+static int quick_vdd_uv_param_set(const char *val, const struct kernel_param *kp)
+{
+	int i, j, old_value;
+	int ret = 0;
+	unsigned int uv, cpu = 0;
+	unsigned int num_levels = cpu_clk[cpu]->vdd_class->num_levels;
+
+	old_value = quick_vdd_uv;
+	ret = param_set_int(val, kp);
+	if (ret) {
+		pr_err("vdd_uv_param_set: ret = %d\n", ret);
+		return ret;
+	}
+
+	if (abs(quick_vdd_uv) < 1 && abs(quick_vdd_uv) > 50) {
+		quick_vdd_uv = old_value;
+		return -EINVAL;
+	}
+
+	for (i = 0; i < num_levels; i++) {
+		if (use_for_scaling(cpu_clk[cpu]->fmax[i] / 1000) < 0)
+			continue;
+
+		uv = cpu_clk[cpu]->vdd_class->vdd_uv[i] / 1000 + quick_vdd_uv;
+
+		if (uv > CPU_VDD_MAX)
+			uv = CPU_VDD_MAX;
+		else if (uv < CPU_VDD_MIN)
+			uv = CPU_VDD_MIN;
+
+		for (j = 0; j < NR_CPUS; j++)
+			cpu_clk[j]->vdd_class->vdd_uv[i] = uv * 1000;
+	}
+
+	arg_vdd_uv += quick_vdd_uv;
+
+	return 0;
+}
+
+static struct kernel_param_ops quick_vdd_uv_ops = {
+	.set = quick_vdd_uv_param_set,
+	.get = param_get_int,
+};
+
+module_param_cb(vdd_uv_quick, &quick_vdd_uv_ops, &quick_vdd_uv, S_IRUGO | S_IWUSR);
+#endif
 
 static int clock_krait_8974_driver_probe(struct platform_device *pdev)
 {

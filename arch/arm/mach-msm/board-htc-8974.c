@@ -86,6 +86,17 @@
 #include <linux/android_ediagpmem.h>
 #endif
 
+#ifdef CONFIG_KEXEC_HARDBOOT
+#include <linux/memblock.h>
+#include <asm/setup.h>
+#endif
+#if defined(CONFIG_LCD_KCAL)
+#include <linux/module.h>
+#include "../../../drivers/video/msm/mdss/mdss_fb.h"
+#include <mach/htc_lcd_kcal.h>
+extern int update_preset_lcdc_lut(void);
+#endif
+
 #if defined(CONFIG_FB_MSM_MDSS_HDMI_MHL_SII8240_SII8558) && defined(CONFIG_HTC_MHL_DETECTION)
 #include "../../../drivers/video/msm/mdss/sii8240_8558/mhl_platform.h"
 #endif
@@ -461,27 +472,52 @@ static void htc_8974_add_usb_devices(void)
 	mid = board_mid();
 
 	if (board_mfg_mode() == 0) {
-#ifdef CONFIG_MACH_DUMMY
+#ifdef CONFIG_MACH_M8_WHL
 		android_usb_pdata.nluns = 2;
 		android_usb_pdata.cdrom_lun = 0x2;
 #elif defined(CONFIG_MACH_DUMMY)
 		android_usb_pdata.nluns = 2;
 		android_usb_pdata.cdrom_lun = 0x2;
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_WHL)
 		android_usb_pdata.nluns = 2;
 		android_usb_pdata.cdrom_lun = 0x2;
 #else
-		android_usb_pdata.nluns = 1;
-		android_usb_pdata.cdrom_lun = 0x1;
+#ifdef CONFIG_EXT_CMD_LINE
+		if (is_m8whl) {
+			android_usb_pdata.nluns = 2;
+			android_usb_pdata.cdrom_lun = 0x2;
+		} else {
+#endif
+			android_usb_pdata.nluns = 1;
+			android_usb_pdata.cdrom_lun = 0x1;
+#ifdef CONFIG_EXT_CMD_LINE
+		}
+#endif
 #endif
 
 	}
 #ifdef CONFIG_MACH_M8
-	android_usb_pdata.product_id	= 0x061A;
+#ifdef CONFIG_EXT_CMD_LINE
+	if (is_m8)
+#endif
+		android_usb_pdata.product_id	= 0x061A;
+#ifdef CONFIG_EXT_CMD_LINE
+	else if (is_m8wl) {
+		android_usb_pdata.product_id	= 0x0616;
+		android_usb_pdata.vzw_unmount_cdrom = 1;
+		android_usb_pdata.nluns = 2;
+		android_usb_pdata.cdrom_lun = 0x3;
+	} else if (is_m8whl)
+		android_usb_pdata.product_id	= 0x061A;
+	else if (is_m8dug)
+		android_usb_pdata.product_id	= 0x063B;
+#endif
 #elif defined(CONFIG_MACH_DUMMY)
 	android_usb_pdata.product_id	= 0x0616;
 	android_usb_pdata.vzw_unmount_cdrom = 1;
-#elif defined(CONFIG_MACH_DUMMY)
+	android_usb_pdata.nluns = 2;
+        android_usb_pdata.cdrom_lun = 0x3;
+#elif defined(CONFIG_MACH_M8_WHL)
 	android_usb_pdata.product_id	= 0x061A;
 #elif defined(CONFIG_MACH_DUMMY)
 	android_usb_pdata.product_id	= 0x0623;
@@ -489,24 +525,28 @@ static void htc_8974_add_usb_devices(void)
 	android_usb_pdata.product_id	= 0x063B;
 #elif defined(CONFIG_MACH_DUMMY)
 	android_usb_pdata.product_id	= 0x0643;
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_M8_UHL)
+	android_usb_pdata.product_id	= 0x063A;
+#elif defined(CONFIG_MACH_MEC_TL)
 	android_usb_pdata.product_id	= 0x0635;
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_UL)
 	android_usb_pdata.product_id	= 0x0638;
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_DUG)
 	android_usb_pdata.product_id	= 0x0636;
 #elif defined(CONFIG_MACH_DUMMY)
 	android_usb_pdata.product_id	= 0x0634;
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_B2_UHL)
 	android_usb_pdata.product_id	= 0x0642;
 #elif defined(CONFIG_MACH_DUMMY)
+	android_usb_pdata.product_id	= 0x0642;
+#elif defined(CONFIG_MACH_MEC_DWG)
 	android_usb_pdata.product_id	= 0x0644;
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MEC_WHL)
 	android_usb_pdata.product_id	= 0x0646;
-#elif defined(CONFIG_MACH_DUMMY)
+#elif defined(CONFIG_MACH_MELS_TUHL)
 	android_usb_pdata.product_id	= 0x0651;
-#elif defined(CONFIG_MACH_DUMMY)
-	android_usb_pdata.product_id	= 0x064C;
+#elif defined(CONFIG_MACH_EYE_UL)
+	android_usb_pdata.product_id    = 0x064C;
 #else
 	
 #endif
@@ -518,7 +558,7 @@ static void htc_8974_add_usb_devices(void)
 
 	platform_device_register(&android_usb_device);
 }
-#if 0
+#if (defined(CONFIG_MACH_DUMMY) || defined(CONFIG_MACH_DUMMY))
 static ssize_t syn_vkeys_show(struct kobject *kobj,
 			struct kobj_attribute *attr, char *buf)
 {
@@ -593,6 +633,54 @@ static void __init htc_8974_early_memory(void)
 	of_scan_flat_dt(dt_scan_for_memory_hole, htc_8974_reserve_table);
 }
 
+
+#if defined(CONFIG_LCD_KCAL)
+extern int g_kcal_r;
+extern int g_kcal_g;
+extern int g_kcal_b;
+
+int kcal_set_values(int kcal_r, int kcal_g, int kcal_b)
+{
+g_kcal_r = kcal_r;
+g_kcal_g = kcal_g;
+g_kcal_b = kcal_b;
+return 0;
+}
+
+static int kcal_get_values(int *kcal_r, int *kcal_g, int *kcal_b)
+{
+*kcal_r = g_kcal_r;
+*kcal_g = g_kcal_g;
+*kcal_b = g_kcal_b;
+return 0;
+}
+
+static int kcal_refresh_values(void)
+{
+return update_preset_lcdc_lut();
+}
+
+static struct kcal_platform_data kcal_pdata = {
+.set_values = kcal_set_values,
+.get_values = kcal_get_values,
+.refresh_display = kcal_refresh_values
+};
+
+static struct platform_device kcal_platrom_device = {
+.name = "kcal_ctrl",
+.dev = {
+.platform_data = &kcal_pdata,
+}
+};
+
+void __init htc_add_lcd_kcal_devices(void)
+{
+pr_info (" LCD_KCAL_DEBUG : %s \n", __func__);
+platform_device_register(&kcal_platrom_device);
+};
+#endif
+
+
 #if defined(CONFIG_HTC_BATT_8960)
 #ifdef CONFIG_HTC_PNPMGR
 extern int pnpmgr_battery_charging_enabled(int charging_enabled);
@@ -628,7 +716,7 @@ static struct htc_battery_platform_data htc_battery_pdev_data = {
 	.normal_usb_temp_threshold = 450, 
 	.usb_temp_overheat_threshold = 650,
 #endif
-#if (defined(CONFIG_MACH_DUMMY) || defined(CONFIG_MACH_DUMMY) || defined(CONFIG_MACH_DUMMY))
+#if (defined(CONFIG_MACH_EYE_UL) || defined(CONFIG_MACH_EYE_WHL) || defined(CONFIG_MACH_EYE_WL))
 	.disable_pwrpath_after_eoc = 1,
 #endif
 	
@@ -663,7 +751,6 @@ static struct htc_battery_platform_data htc_battery_pdev_data = {
 						pm8941_get_input_voltage_regulation,
 	.icharger.store_battery_charger_data = pm8941_store_battery_charger_data_emmc,
 	.icharger.set_ftm_charge_enable_type = pm8941_set_ftm_charge_enable_type,
-	.icharger.set_charger_after_eoc = pm8941_set_charger_after_eoc,
 	
 	.igauge.name = "pm8941",
 	.igauge.get_battery_voltage = pm8941_get_batt_voltage,
@@ -736,7 +823,7 @@ void __init htc_8974_add_drivers(void)
 	htc_batt_cell_register();
 	msm8974_add_batt_devices();
 #endif 
-#if 0
+#if (defined(CONFIG_MACH_DUMMY) || defined(CONFIG_MACH_DUMMY))
 	syn_init_vkeys_8974();
 #endif
 	htc_8974_cable_detect_register();
@@ -752,6 +839,9 @@ void __init htc_8974_add_drivers(void)
 #endif
 #ifdef CONFIG_HTC_POWER_DEBUG
 	htc_cpu_usage_register();
+#endif
+#if defined(CONFIG_LCD_KCAL)
+	htc_add_lcd_kcal_devices();
 #endif
 }
 
@@ -805,6 +895,26 @@ static void __init htc_8974_map_io(void)
 
 void __init htc_8974_init_early(void)
 {
+#ifdef CONFIG_KEXEC_HARDBOOT
+	// Reserve space for hardboot page - just after ram_console,
+	// at the start of second memory bank
+	int ret;
+	phys_addr_t start;
+	struct membank* bank;
+
+	if (meminfo.nr_banks < 2) {
+		pr_err("%s: not enough membank\n", __func__);
+		return;
+	}
+	
+	bank = &meminfo.bank[1];
+	start = bank->start + SZ_1M + HTC_8974_PERSISTENT_RAM_SIZE;
+	ret = memblock_remove(start, SZ_1M);
+	if(!ret)
+		pr_info("Hardboot page reserved at 0x%X\n", start);
+	else
+		pr_err("Failed to reserve space for hardboot page at 0x%X!\n", start);
+#endif
 	
 	persistent_ram_early_init(&htc_8974_persistent_ram);
 

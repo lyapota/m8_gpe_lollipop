@@ -46,7 +46,6 @@ int pm8941_is_batt_temperature_fault(int *result);
 int pm8941_set_pwrsrc_and_charger_enable(enum htc_power_source_type src,
 			bool chg_enable, bool pwrsrc_enable);
 int pm8941_charger_enable(bool enable);
-int pm8941_set_charger_after_eoc(bool enable);
 int pm8941_pwrsrc_enable(bool enable);
 int pm8941_get_battery_status(void);
 int pm8941_get_batt_present(void);
@@ -238,10 +237,6 @@ static inline int pm8941_usb_overheat_otg_mode_check(void)
 	return -ENXIO;
 }
 static inline int pm8941_set_ftm_charge_enable_type(enum htc_ftm_power_source_type ftm_src)
-{
-	return -ENXIO;
-}
-static inline int pm8941_set_charger_after_eoc(bool enable)
 {
 	return -ENXIO;
 }

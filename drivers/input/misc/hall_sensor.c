@@ -50,6 +50,9 @@ static int prev_val_n = 0;
 static int prev_val_s = 0;
 static int first_boot_s = 1;
 static int first_boot_n = 1;
+static int hall_enabled = 1;
+
+module_param_named(hall_state, hall_enabled, int, S_IRUGO);
 
 static void report_cover_event(int pole, int irq, struct ak_hall_data *hl);
 static ssize_t debug_level_set(struct device *dev, struct device_attribute *attr,
@@ -117,6 +120,7 @@ static ssize_t write_att(struct device *dev, struct device_attribute *attr,
 			hl->hall_enable = 0;
 			irq_set_irq_wake(gpio_to_irq(hl->gpio_att_s), 0);
 			irq_set_irq_wake(gpio_to_irq(hl->gpio_att), 0);
+			hall_enabled = 0;
 		}
 		else if(hl->hall_enable == 0 && buf[0] == '1')
 		{
@@ -128,6 +132,7 @@ static ssize_t write_att(struct device *dev, struct device_attribute *attr,
 			hl->hall_enable = 1;
 			irq_set_irq_wake(gpio_to_irq(hl->gpio_att_s), 1);
 			irq_set_irq_wake(gpio_to_irq(hl->gpio_att), 1);
+			hall_enabled = 1;
 		}
 		else
 			HL_LOG("Invalid paramater(0:Disable 1:Enable) hall enable = %d\n", hl->hall_enable);

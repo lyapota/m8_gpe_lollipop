@@ -150,3 +150,7 @@ obj-$(CONFIG_SENSORS)		+= sensors/
 
 # htc stability files
 obj-y += htc_debug/stability/
+
+obj-$(CONFIG_CPUQUIET_FRAMEWORK)+= cpuquiet/
+obj-$(CONFIG_INTELLI_PLUG)	+= cpuintelli/
+obj-$(CONFIG_MAKO_HOTPLUG)	+= cpumako/

@@ -36,8 +36,8 @@
 
 #ifdef CONFIG_HTC_DEBUG_FOOTPRINT
 #include <mach/htc_footprint.h>
-#include <mach/clk-provider.h>
 #endif
+#include <mach/clk-provider.h>
 
 #include "acpuclock.h"
 
@@ -54,6 +54,15 @@ static struct clk *l2_clk;
 static unsigned int freq_index[NR_CPUS];
 static unsigned int max_freq_index;
 static struct cpufreq_frequency_table *freq_table;
+#ifdef CONFIG_MSM_CPU_VOLTAGE_CONTROL
+static struct cpufreq_frequency_table *krait_freq_table;
+#endif
+
+#ifdef CONFIG_EDP_LIMIT
+static unsigned int max_freq_table_index; 
+static unsigned int freq_req_cnt;
+#endif
+
 static unsigned int *l2_khz;
 static bool is_clk;
 static bool is_sync;
@@ -127,6 +136,10 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 			unsigned int index)
 {
 	int ret = 0;
+#ifdef CONFIG_EDP_LIMIT
+	int cpu;
+	int cpu_cnt = 0;
+#endif
 	int saved_sched_policy = -EINVAL;
 	int saved_sched_rt_prio = -EINVAL;
 	struct cpufreq_freqs freqs;
@@ -134,6 +147,22 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 
 	if (policy->cpu >= 1 && is_sync)
 		return 0;
+
+#ifdef CONFIG_EDP_LIMIT
+	if (edp_limit) {
+		for_each_online_cpu(cpu)
+			cpu_cnt++;
+		if (cpu_cnt > 1 && index >= max_freq_table_index - 1) {
+			freq_req_cnt++;
+			if (freq_req_cnt > edp_limit) {
+				freq_req_cnt--;
+				index = max_freq_table_index - 1;
+				new_freq = freq_table[index].frequency;
+			}
+		} else if ((cpu_cnt <= 1 || index < 7) && freq_req_cnt > 0)
+			freq_req_cnt--;
+	}
+#endif
 
 #ifdef CONFIG_ARCH_MSM8974
 	mutex_lock(&set_cpufreq_lock);
@@ -496,6 +525,12 @@ static int cpufreq_parse_dt(struct device *dev)
 		if (i > 0 && f <= freq_table[i-1].frequency)
 			break;
 
+#ifdef CONFIG_EXT_CMD_LINE
+		if (f > arg_cpu_oc) {
+			nf = i;
+			break;
+		}
+#endif		
 		freq_table[i].index = i;
 		freq_table[i].frequency = f;
 
@@ -516,6 +551,23 @@ static int cpufreq_parse_dt(struct device *dev)
 
 	freq_table[i].index = i;
 	freq_table[i].frequency = CPUFREQ_TABLE_END;
+#ifdef CONFIG_EXT_CMD_LINE
+	max_freq_table_index = i - 1;	
+#endif
+	
+#ifdef CONFIG_MSM_CPU_VOLTAGE_CONTROL
+	/* Create frequence table with unrounded values */
+	krait_freq_table = devm_kzalloc(dev, (nf + 1) * sizeof(*krait_freq_table),
+					GFP_KERNEL);
+	if (!krait_freq_table)
+		return -ENOMEM;
+
+	*krait_freq_table = *freq_table;
+
+	for (i = 0, j = 0; i < nf; i++, j += 3)
+		krait_freq_table[i].frequency = data[j];
+	krait_freq_table[i].frequency = CPUFREQ_TABLE_END;
+#endif
 
 	devm_kfree(dev, data);
 
@@ -556,6 +608,26 @@ const struct file_operations msm_cpufreq_fops = {
 	.llseek		= seq_lseek,
 	.release	= seq_release,
 };
+#endif
+
+#ifdef CONFIG_MSM_CPU_VOLTAGE_CONTROL
+int use_for_scaling(unsigned int freq)
+{
+	unsigned int i, cpu_freq;
+
+	if (!krait_freq_table)
+		return -EINVAL;
+
+	for (i = 0; krait_freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
+		cpu_freq = krait_freq_table[i].frequency;
+		if (cpu_freq == CPUFREQ_ENTRY_INVALID)
+			continue;
+		if (freq == cpu_freq)
+			return freq;
+	}
+
+	return -EINVAL;
+}
 #endif
 
 static int __init msm_cpufreq_probe(struct platform_device *pdev)
