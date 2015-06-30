@@ -387,6 +387,7 @@ struct qpnp_chg_chip {
 	int				power_bank_wa_step;
 	int				power_bank_drop_usb_ma;
 	int 				is_aicl_adapter_wa_enabled;
+	int 				disable_pwrpath_after_eoc;
 	unsigned int			safe_current;
 	unsigned int			revision;
 	unsigned int			type;
@@ -1363,6 +1364,11 @@ qpnp_chg_set_appropriate_vbatdet(struct qpnp_chg_chip *chip)
 	
 	msleep(2000);
 	qpnp_chg_charge_en(chip, true);
+
+	
+	if (chip->disable_pwrpath_after_eoc)
+		qpnp_chg_force_run_on_batt(chip, true);
+
 	wake_unlock(&chip->set_vbatdet_lock);
 
 	return rc;
@@ -3807,9 +3813,11 @@ int pm8941_set_pwrsrc_and_charger_enable(enum htc_power_source_type src,
 	case HTC_PWR_SOURCE_TYPE_DETECTING:
 	case HTC_PWR_SOURCE_TYPE_UNKNOWN_USB:
 	case HTC_PWR_SOURCE_TYPE_USB:
+#ifdef CONFIG_FORCE_FAST_CHARGE 
 		if (force_fast_charge) 
 			mA = USB_MA_1100; 
 		else 
+#endif
 			mA = USB_MA_500;
 		break;
 	case HTC_PWR_SOURCE_TYPE_AC:
@@ -4341,6 +4349,24 @@ static int get_dc_chgpth_reg(void *data, u64 *val)
 	pr_debug("addr:0x%X, val:0x%X\n", (the_chip->dc_chgpth_base + addr), dc_chgpth_sts);
 	*val = dc_chgpth_sts;
 	return 0;
+}
+
+int pm8941_set_charger_after_eoc(bool enable)
+{
+	int rc = 0;
+
+	if (!the_chip) {
+		pr_err("called before init\n");
+		return -EINVAL;
+	}
+	is_batt_full_eoc_stop = false;
+
+	qpnp_chg_force_run_on_batt(the_chip, false);
+
+	
+	qpnp_chg_charge_en(the_chip, enable);
+
+	return rc;
 }
 
 static void dump_reg(void)
@@ -7602,6 +7628,7 @@ qpnp_charger_read_dt_props(struct qpnp_chg_chip *chip)
 	OF_PROP_READ(chip, stored_pre_delta_vddmax_mv, "stored-pre-delta-vddmax-mv", rc, true);
 	OF_PROP_READ(chip, batt_stored_magic_num, "stored-batt-magic-num", rc, true);
 	OF_PROP_READ(chip, is_aicl_adapter_wa_enabled, "is-aicl-adapter-wa-enabled", rc, true);
+	OF_PROP_READ(chip, disable_pwrpath_after_eoc, "disable-pwrpath-after-eoc", rc, true);
 
 	if (rc) {
 		pr_err("failed to read required dt parameters %d\n", rc);
