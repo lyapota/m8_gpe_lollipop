@@ -1729,6 +1729,29 @@ unsigned long avg_cpu_nr_running(unsigned int cpu)
 	return q->ave_nr_running;
 }
 EXPORT_SYMBOL(avg_cpu_nr_running);
+
+u64 nr_running_integral(unsigned int cpu)
+{
+	unsigned int seqcnt;
+	u64 integral;
+	struct rq *q;
+	if (cpu >= nr_cpu_ids)
+		return 0;
+	q = cpu_rq(cpu);
+	/*
+	* Update average to avoid reading stalled value if there were
+	* no run-queue changes for a long time. On the other hand if
+	* the changes are happening right now, just read current value
+	* directly.
+	*/
+	seqcnt = read_seqcount_begin(&q->ave_seqcnt);
+	integral = do_nr_running_integral(q);
+	if (read_seqcount_retry(&q->ave_seqcnt, seqcnt)) {
+		read_seqcount_begin(&q->ave_seqcnt);
+		integral = q->nr_running_integral;
+	}
+	return integral;
+}
 #endif
 
 static atomic_long_t calc_load_tasks;

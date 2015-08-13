@@ -139,6 +139,9 @@ extern int nr_processes(void);
 extern unsigned long nr_running(void);
 extern unsigned long nr_uninterruptible(void);
 extern unsigned long nr_iowait(void);
+#if defined(CONFIG_CPUQUIET_FRAMEWORK)
+extern u64 nr_running_integral(unsigned int cpu);
+#endif
 extern unsigned long nr_iowait_cpu(int cpu);
 extern unsigned long this_cpu_load(void);
 

@@ -368,6 +368,9 @@ struct rq {
 	/* time-based average load */
 	u64 nr_last_stamp;
 	unsigned int ave_nr_running;
+#if defined(CONFIG_CPUQUIET_FRAMEWORK)
+        u64 nr_running_integral;
+#endif
 	seqcount_t ave_seqcnt;
 
 	/* capture load from *all* tasks on this cpu: */
@@ -955,6 +958,19 @@ static inline unsigned int do_avg_nr_running(struct rq *rq)
 			NR_AVE_DIV_PERIOD(deltax * (nr - ave_nr_running));
 
 	return ave_nr_running;
+}
+
+static inline u64 do_nr_running_integral(struct rq *rq)
+{
+	s64 nr, deltax;
+	u64 nr_running_integral = rq->nr_running_integral;
+
+	deltax = rq->clock_task - rq->nr_last_stamp;
+	nr = NR_AVE_SCALE(rq->nr_running);
+
+	nr_running_integral += nr * deltax;
+
+	return nr_running_integral;
 }
 #endif
 
