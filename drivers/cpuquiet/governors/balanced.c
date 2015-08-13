@@ -41,8 +41,8 @@ extern unsigned int gov_enabled;
 
 #define CPUNAMELEN 8
 
-#define UP_DELAY_MS			70
-#define DOWN_DELAY_MS		500
+#define UP_DELAY_MS			100
+#define DOWN_DELAY_MS		2000
 
 typedef enum {
 	CPU_SPEED_BALANCED,
@@ -123,7 +123,7 @@ static void start_load_timer(void)
 		iinfo->idle_current =
 			get_cpu_idle_time_us(i, &iinfo->timestamp);
 	}
-	mod_timer(&load_timer, jiffies + msecs_to_jiffies(100));
+	mod_timer(&load_timer, jiffies + msecs_to_jiffies(load_sample_rate));
 }
 
 static void stop_load_timer(void)
@@ -183,12 +183,87 @@ static unsigned int count_slow_cpus(unsigned int limit)
 }
 
 #define NR_FSHIFT	2
-static unsigned int nr_run_thresholds[] = {
+
+static unsigned int rt_profile_sel;
+static unsigned int core_bias; //Dummy variable exposed to userspace
+
+static unsigned int rt_profile_default[] = {
 /*      1,  2,  3,  4 - on-line cpus target */
-	5,  9, 10, UINT_MAX /* avg run threads * 4 (e.g., 9 = 2.25 threads) */
+	5,  9, 10, UINT_MAX
 };
+
+static unsigned int rt_profile_1[] = {
+/*      1,  2,  3,  4 - on-line cpus target */
+	8,  9, 10, UINT_MAX
+};
+
+static unsigned int rt_profile_2[] = {
+/*      1,  2,  3,  4 - on-line cpus target */
+	5,  13, 14, UINT_MAX
+};
+
+static unsigned int rt_profile_disable[] = {
+/*      1,  2,  3,  4 - on-line cpus target */
+	0,  0, 0, UINT_MAX
+};
+
+static unsigned int *rt_profiles[] = {
+	rt_profile_default,
+	rt_profile_1,
+	rt_profile_2,
+	rt_profile_disable
+};
+
 static unsigned int nr_run_hysteresis = 2;	/* 0.5 thread */
 static unsigned int nr_run_last;
+
+struct runnables_avg_sample {
+	u64 previous_integral;
+	unsigned int avg;
+	bool integral_sampled;
+	u64 prev_timestamp;
+};
+
+static DEFINE_PER_CPU(struct runnables_avg_sample, avg_nr_sample);
+
+static unsigned int get_avg_nr_runnables(void)
+{
+	unsigned int i, sum = 0;
+	struct runnables_avg_sample *sample;
+	u64 integral, old_integral, delta_integral, delta_time, cur_time;
+
+	for_each_online_cpu(i) {
+		sample = &per_cpu(avg_nr_sample, i);
+		integral = nr_running_integral(i);
+		old_integral = sample->previous_integral;
+		sample->previous_integral = integral;
+		cur_time = ktime_to_ns(ktime_get());
+		delta_time = cur_time - sample->prev_timestamp;
+		sample->prev_timestamp = cur_time;
+
+		if (!sample->integral_sampled) {
+			sample->integral_sampled = true;
+			/* First sample to initialize prev_integral, skip
+			 * avg calculation
+			 */
+			continue;
+		}
+
+		if (integral < old_integral) {
+			/* Overflow */
+			delta_integral = (ULLONG_MAX - old_integral) + integral;
+		} else {
+			delta_integral = integral - old_integral;
+		}
+
+		/* Calculate average for the previous sample window */
+		do_div(delta_integral, delta_time);
+		sample->avg = delta_integral;
+		sum += sample->avg;
+	}
+
+	return sum;
+}
 
 static CPU_SPEED_BALANCE balanced_speed_balance(void)
 {
@@ -196,15 +271,16 @@ static CPU_SPEED_BALANCE balanced_speed_balance(void)
 	unsigned long balanced_speed = highest_speed * balance_level / 100;
 	unsigned long skewed_speed = balanced_speed / 2;
 	unsigned int nr_cpus = num_online_cpus();
-	unsigned int max_cpus = cpq_max_cpus();
-	unsigned int avg_nr_run = avg_nr_running();
+	unsigned int max_cpus = cpq_max_cpus() ? : 4;
+	unsigned int avg_nr_run = get_avg_nr_runnables();
 	unsigned int nr_run;
+	unsigned int *current_profile = rt_profiles[rt_profile_sel];
 
 	/* balanced: freq targets for all CPUs are above 50% of highest speed
 	   biased: freq target for at least one CPU is below 50% threshold
 	   skewed: freq targets for at least 2 CPUs are below 25% threshold */
-	for (nr_run = 1; nr_run < ARRAY_SIZE(nr_run_thresholds); nr_run++) {
-		unsigned int nr_threshold = nr_run_thresholds[nr_run - 1];
+	for (nr_run = 1; nr_run < ARRAY_SIZE(rt_profile_default); nr_run++) {
+		unsigned int nr_threshold = current_profile[nr_run - 1];
 		if (nr_run_last <= nr_run)
 			nr_threshold += nr_run_hysteresis;
 		if (avg_nr_run <= (nr_threshold << (FSHIFT - NR_FSHIFT)))
@@ -334,8 +410,8 @@ static int balanced_cpufreq_transition(struct notifier_block *nb,
 			}
 			break;
 		default:
-			pr_err("%s: invalid tegra hotplug state %d\n",
-				__func__, balanced_state);
+			pr_err("%s: invalid cpuquiet balanced governor "
+				"state %d\n", __func__, balanced_state);
 		}
 	}
 
@@ -346,41 +422,27 @@ static struct notifier_block balanced_cpufreq_nb = {
 	.notifier_call = balanced_cpufreq_transition,
 };
 
-static ssize_t show_nr_run_thresholds(struct cpuquiet_attribute *cattr, char *buf)
+static void core_bias_callback (struct cpuquiet_attribute *attr)
 {
-	char *out = buf;
-	
-	out += sprintf(out, "%d %d %d %d\n", nr_run_thresholds[0], nr_run_thresholds[1], nr_run_thresholds[2], nr_run_thresholds[3]);
-
-	return out - buf;
-}
-
-static ssize_t store_nr_run_thresholds(struct cpuquiet_attribute *cattr,
-					const char *buf, size_t count)
-{
-	int ret;
-	int user_nr_run_thresholds[] = { 5, 9, 10, UINT_MAX };
-	
-	ret = sscanf(buf, "%d %d %d %d", &user_nr_run_thresholds[0], &user_nr_run_thresholds[1], &user_nr_run_thresholds[2], &user_nr_run_thresholds[3]);
-
-	if (ret != 4)
-		return -EINVAL;
-
-	nr_run_thresholds[0] = user_nr_run_thresholds[0];
-	nr_run_thresholds[1] = user_nr_run_thresholds[1];
-	nr_run_thresholds[2] = user_nr_run_thresholds[2];
-	nr_run_thresholds[3] = user_nr_run_thresholds[3];
-	
-	return count;
+	unsigned long val;
+	if (attr) {
+		val = (*((unsigned int*)(attr->param)));
+		if (val < ARRAY_SIZE(rt_profiles)) {
+			rt_profile_sel = val;
+		}
+		else {	//Revert the change due to invalid range
+			core_bias = rt_profile_sel;
+		}
+	}
 }
 					
 CPQ_BASIC_ATTRIBUTE(balance_level, 0644, uint);
 CPQ_BASIC_ATTRIBUTE(idle_bottom_freq, 0644, uint);
 CPQ_BASIC_ATTRIBUTE(idle_top_freq, 0644, uint);
 CPQ_BASIC_ATTRIBUTE(load_sample_rate, 0644, uint);
+CPQ_ATTRIBUTE(core_bias, 0644, uint, core_bias_callback);
 CPQ_BASIC_ATTRIBUTE(up_delay, 0644, uint);
 CPQ_BASIC_ATTRIBUTE(down_delay, 0644, uint);
-CPQ_ATTRIBUTE_CUSTOM(nr_run_thresholds, 0644, show_nr_run_thresholds, store_nr_run_thresholds);
 CPQ_BASIC_ATTRIBUTE(nr_run_hysteresis, 0644, uint);
 
 static struct attribute *balanced_attributes[] = {
@@ -390,7 +452,7 @@ static struct attribute *balanced_attributes[] = {
 	&up_delay_attr.attr,
 	&down_delay_attr.attr,
 	&load_sample_rate_attr.attr,
-	&nr_run_thresholds_attr.attr,
+	&core_bias_attr.attr,
 	&nr_run_hysteresis_attr.attr,
 	NULL,
 };
@@ -460,8 +522,13 @@ static int balanced_start(void)
 	INIT_DELAYED_WORK(&balanced_work, balanced_work_func);
 	
 	table = cpufreq_frequency_get_table(0);
+	if (!table)
+		return -EINVAL;
 
 	for (count = 0; table[count].frequency != CPUFREQ_TABLE_END; count++);
+	
+	if (count < 4)
+		return -EINVAL;
 
 	idle_top_freq = table[(count / 2) - 1].frequency;
 	idle_bottom_freq = table[(count / 2) - 2].frequency;
@@ -501,4 +568,3 @@ MODULE_LICENSE("GPL");
 // must not be in fs_initcall else it will crash in balanced_start
 module_init(init_balanced);
 module_exit(exit_balanced);
-
