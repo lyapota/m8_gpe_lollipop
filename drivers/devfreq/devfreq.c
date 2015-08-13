@@ -89,7 +89,25 @@ static int devfreq_update_status(struct devfreq *devfreq, unsigned long freq)
 {
 	int lev, prev_lev;
 	unsigned long cur_time;
+#ifdef CONFIG_ADRENO_IDLER
+	int ret = 0;
+	cur_time = jiffies;
 
+	prev_lev = devfreq_get_freq_level(devfreq, devfreq->previous_freq);
+	if (prev_lev < 0) {
+		ret = prev_lev;
+		goto out;
+	}
+
+	devfreq->time_in_state[prev_lev] +=
+			 cur_time - devfreq->last_stat_updated;
+
+	lev = devfreq_get_freq_level(devfreq, freq);
+	if (lev < 0) {
+		ret = lev;
+		goto out;
+	}
+#else
 	lev = devfreq_get_freq_level(devfreq, freq);
 	if (lev < 0)
 		return lev;
@@ -105,6 +123,7 @@ static int devfreq_update_status(struct devfreq *devfreq, unsigned long freq)
 	prev_lev = devfreq_get_freq_level(devfreq, devfreq->previous_freq);
 	if (prev_lev < 0)
 		return 0;
+#endif
 
 	if (lev != prev_lev) {
 		devfreq->trans_table[(prev_lev *
@@ -112,7 +131,13 @@ static int devfreq_update_status(struct devfreq *devfreq, unsigned long freq)
 		devfreq->total_trans++;
 	}
 
+#ifdef CONFIG_ADRENO_IDLER
+out:
+	devfreq->last_stat_updated = cur_time;
+	return ret;
+#else
 	return 0;
+#endif
 }
 
 static struct devfreq_governor *find_devfreq_governor(const char *name)
@@ -382,7 +407,11 @@ struct devfreq *devfreq_add_device(struct device *dev,
 	devfreq->dev.class = devfreq_class;
 	devfreq->dev.release = devfreq_dev_release;
 	devfreq->profile = profile;
+#ifdef CONFIG_ADRENO_IDLER
+	strncpy(devfreq->governor_name, governor_name, DEVFREQ_NAME_LEN);
+#else
 	strncpy(devfreq->governor_name, governor_name, DEVFREQ_NAME_LEN - 1);
+#endif
 	devfreq->previous_freq = profile->initial_freq;
 
 	devfreq->data = data ? data : find_governor_data(devfreq->profile,
@@ -778,6 +807,16 @@ static ssize_t show_available_freqs(struct device *d,
 				    char *buf)
 {
 	struct devfreq *df = to_devfreq(d);
+#ifdef CONFIG_ADRENO_IDLER
+	int index, num_chars = 0;
+
+	for (index = 0; index < df->profile->max_state; index++)
+		num_chars += snprintf(buf + num_chars, PAGE_SIZE, "%d ",
+		df->profile->freq_table[index]);
+	buf[num_chars++] = '\n';
+
+	return num_chars;
+#else
 	struct device *dev = df->dev.parent;
 	struct opp *opp;
 	ssize_t count = 0;
@@ -802,6 +841,7 @@ static ssize_t show_available_freqs(struct device *d,
 	count += sprintf(&buf[count], "\n");
 
 	return count;
+#endif
 }
 
 static ssize_t show_trans_table(struct device *dev, struct device_attribute *attr,
@@ -845,6 +885,26 @@ static ssize_t show_trans_table(struct device *dev, struct device_attribute *att
 	return len;
 }
 
+#ifdef CONFIG_ADRENO_IDLER
+static ssize_t show_time_in_state(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct devfreq *devfreq = to_devfreq(dev);
+	ssize_t len = 0;
+	int i, err;
+
+	err = devfreq_update_status(devfreq, devfreq->previous_freq);
+	if (err)
+		return 0;
+
+	for (i = 0; i < devfreq->profile->max_state; i++) {
+		len += sprintf(buf + len, "%u %u\n",
+			devfreq->profile->freq_table[i],
+			jiffies_to_msecs(devfreq->time_in_state[i]));
+	}
+	return len;
+}
+#endif
 static struct device_attribute devfreq_attrs[] = {
 	__ATTR(governor, S_IRUGO | S_IWUSR, show_governor, store_governor),
 	__ATTR(available_governors, S_IRUGO, show_available_governors, NULL),
@@ -856,6 +916,9 @@ static struct device_attribute devfreq_attrs[] = {
 	__ATTR(min_freq, S_IRUGO | S_IWUSR, show_min_freq, store_min_freq),
 	__ATTR(max_freq, S_IRUGO | S_IWUSR, show_max_freq, store_max_freq),
 	__ATTR(trans_stat, S_IRUGO, show_trans_table, NULL),
+#ifdef CONFIG_ADRENO_IDLER
+	__ATTR(time_in_state, S_IRUGO, show_time_in_state, NULL),
+#endif
 	{ },
 };
 
@@ -867,7 +930,14 @@ static int __init devfreq_init(void)
 		return PTR_ERR(devfreq_class);
 	}
 
+#ifdef CONFIG_ADRENO_IDLER
+	devfreq_wq =
+	    alloc_workqueue("devfreq_wq",
+			    WQ_HIGHPRI | WQ_UNBOUND | WQ_FREEZABLE |
+			    WQ_MEM_RECLAIM, 0);
+#else
 	devfreq_wq = create_freezable_workqueue("devfreq_wq");
+#endif
 	if (IS_ERR(devfreq_wq)) {
 		class_destroy(devfreq_class);
 		pr_err("%s: couldn't create workqueue\n", __FILE__);
