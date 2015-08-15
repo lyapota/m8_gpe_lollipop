@@ -30,6 +30,9 @@ extern unsigned int cpq_max_cpus(void);
 extern unsigned int cpq_min_cpus(void);
 // from cpuquiet_driver.c
 extern unsigned int best_core_to_turn_up (void);
+//from core.c
+extern unsigned long avg_nr_running(void);
+extern unsigned long avg_cpu_nr_running(unsigned int cpu);
 
 // from sysfs.c
 extern unsigned int gov_enabled;
@@ -40,13 +43,14 @@ typedef enum {
 	RUNNING,
 } RUNNABLES_STATE;
 
-static struct work_struct runnables_work;
+static struct delayed_work runnables_work;
 static struct kobject *runnables_kobject;
-static struct timer_list runnables_timer;
 
-static RUNNABLES_STATE runnables_state;
 /* configurable parameters */
 static unsigned int sample_rate = 20;		/* msec */
+
+static RUNNABLES_STATE runnables_state;
+static struct workqueue_struct *runnables_wq;
 
 #define NR_FSHIFT_EXP	3
 #define NR_FSHIFT	(1 << NR_FSHIFT_EXP)
@@ -62,67 +66,11 @@ static unsigned int nr_run_thresholds[NR_CPUS];
 
 DEFINE_MUTEX(runnables_lock);
 
-struct runnables_avg_sample {
-	u64 previous_integral;
-	unsigned int avg;
-	bool integral_sampled;
-	u64 prev_timestamp;
-};
-
-static DEFINE_PER_CPU(struct runnables_avg_sample, avg_nr_sample);
-
 /* EXP = alpha in the exponential moving average.
  * Alpha = e ^ (-sample_rate / window_size) * FIXED_1
  * Calculated for sample_rate of 20ms, window size of 100ms
  */
 #define EXP    1677
-
-static unsigned int get_avg_nr_runnables(void)
-{
-	unsigned int i, sum = 0;
-	static unsigned int avg;
-	struct runnables_avg_sample *sample;
-	u64 integral, old_integral, delta_integral, delta_time, cur_time;
-
-	for_each_online_cpu(i) {
-		sample = &per_cpu(avg_nr_sample, i);
-		integral = nr_running_integral(i);
-		old_integral = sample->previous_integral;
-		sample->previous_integral = integral;
-		cur_time = ktime_to_ns(ktime_get());
-		delta_time = cur_time - sample->prev_timestamp;
-		sample->prev_timestamp = cur_time;
-
-		if (!sample->integral_sampled) {
-			sample->integral_sampled = true;
-			/* First sample to initialize prev_integral, skip
-			 * avg calculation
-			 */
-			continue;
-		}
-
-		if (integral < old_integral) {
-			/* Overflow */
-			delta_integral = (ULLONG_MAX - old_integral) + integral;
-		} else {
-			delta_integral = integral - old_integral;
-		}
-
-		/* Calculate average for the previous sample window */
-		do_div(delta_integral, delta_time);
-		sample->avg = delta_integral;
-		sum += sample->avg;
-	}
-
-	/* Exponential moving average
-	 * Avgn = Avgn-1 * alpha + new_avg * (1 - alpha)
-	 */
-	avg *= EXP;
-	avg += sum * (FIXED_1 - EXP);
-	avg >>= FSHIFT;
-
-	return avg;
-}
 
 static int get_action(unsigned int nr_run)
 {
@@ -148,8 +96,7 @@ static void runnables_avg_sampler(unsigned long data)
 	if (runnables_state != RUNNING)
 		return;
 
-	avg_nr_run = get_avg_nr_runnables();
-	mod_timer(&runnables_timer, jiffies + msecs_to_jiffies(sample_rate));
+	avg_nr_run = avg_nr_running();
 
 	for (nr_run = 1; nr_run < ARRAY_SIZE(nr_run_thresholds); nr_run++) {
 		unsigned int nr_threshold = nr_run_thresholds[nr_run - 1];
@@ -164,8 +111,10 @@ static void runnables_avg_sampler(unsigned long data)
 	action = get_action(nr_run);
 	if (action != 0) {
 		wmb();
-		schedule_work(&runnables_work);
 	}
+
+	queue_delayed_work(runnables_wq, &runnables_work,
+				msecs_to_jiffies(sample_rate));
 }
 
 static unsigned int get_lightest_loaded_cpu_n(void)
@@ -175,8 +124,8 @@ static unsigned int get_lightest_loaded_cpu_n(void)
 	int i;
 
 	for_each_online_cpu(i) {
-		struct runnables_avg_sample *s = &per_cpu(avg_nr_sample, i);
-		unsigned int nr_runnables = s->avg;
+		unsigned int nr_runnables = avg_cpu_nr_running(i);
+
 		if (i > 0 && min_avg_runnables > nr_runnables) {
 			cpu = i;
 			min_avg_runnables = nr_runnables;
@@ -196,6 +145,8 @@ static void runnables_work_func(struct work_struct *work)
 
 	if (runnables_state != RUNNING)
 		return;
+
+	runnables_avg_sampler(0);
 
 	action = get_action(nr_run_last);
 	if (action > 0) {
@@ -303,7 +254,7 @@ static void runnables_device_busy(void)
 	mutex_lock(&runnables_lock);
 	if (runnables_state == RUNNING) {
 		runnables_state = IDLE;
-		del_timer_sync(&runnables_timer);
+		cancel_delayed_work_sync(&runnables_work);
 	}
 	mutex_unlock(&runnables_lock);
 }
@@ -313,7 +264,7 @@ static void runnables_device_free(void)
 	mutex_lock(&runnables_lock);
 	if (runnables_state == IDLE) {
 		runnables_state = RUNNING;
-		mod_timer(&runnables_timer, jiffies + 1);
+		runnables_work_func(NULL);
 	}
 	mutex_unlock(&runnables_lock);
 }
@@ -323,7 +274,8 @@ static void runnables_stop(void)
 	mutex_lock(&runnables_lock);
 
 	runnables_state = DISABLED;
-	del_timer_sync(&runnables_timer);
+	cancel_delayed_work_sync(&runnables_work);
+	destroy_workqueue(runnables_wq);
 	kobject_put(runnables_kobject);
 	kfree(runnables_kobject);
 	
@@ -338,10 +290,11 @@ static int runnables_start(void)
 	if (err)
 		return err;
 
-	INIT_WORK(&runnables_work, runnables_work_func);
+	runnables_wq = alloc_workqueue("cpuquiet-runnables", WQ_HIGHPRI, 0);
+	if (!runnables_wq)
+		return -ENOMEM;
 
-	init_timer(&runnables_timer);
-	runnables_timer.function = runnables_avg_sampler;
+	INIT_DELAYED_WORK(&runnables_work, runnables_work_func);
 
 	for(i = 0; i < ARRAY_SIZE(nr_run_thresholds); ++i) {
 		if (i == (ARRAY_SIZE(nr_run_thresholds) - 1))
@@ -357,7 +310,7 @@ static int runnables_start(void)
 	runnables_state = RUNNING;
 	mutex_unlock(&runnables_lock);
 
-	runnables_avg_sampler(0);
+    runnables_work_func(NULL);
 
 	return 0;
 }
