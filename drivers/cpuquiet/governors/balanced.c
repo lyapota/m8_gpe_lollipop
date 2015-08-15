@@ -33,16 +33,11 @@ extern unsigned int cpq_max_cpus(void);
 extern unsigned int cpq_min_cpus(void);
 // from cpuquiet_driver.c
 extern unsigned int best_core_to_turn_up (void);
-// from core.c
-extern unsigned long avg_nr_running(void);
 
 // from sysfs.c
 extern unsigned int gov_enabled;
 
 #define CPUNAMELEN 8
-
-#define UP_DELAY_MS			100
-#define DOWN_DELAY_MS		2000
 
 typedef enum {
 	CPU_SPEED_BALANCED,
@@ -73,8 +68,8 @@ static bool load_timer_active;
 static unsigned int  balance_level = 60;
 static unsigned int  idle_bottom_freq;
 static unsigned int  idle_top_freq;
-static unsigned int	 up_delay = UP_DELAY_MS;
-static unsigned int	 down_delay = DOWN_DELAY_MS;
+static unsigned long up_delay;
+static unsigned long down_delay;
 static unsigned long last_change_time;
 static unsigned int  load_sample_rate = 20; /* msec */
 static struct workqueue_struct *balanced_wq;
@@ -123,7 +118,7 @@ static void start_load_timer(void)
 		iinfo->idle_current =
 			get_cpu_idle_time_us(i, &iinfo->timestamp);
 	}
-	mod_timer(&load_timer, jiffies + msecs_to_jiffies(load_sample_rate));
+	mod_timer(&load_timer, jiffies + msecs_to_jiffies(100));
 }
 
 static void stop_load_timer(void)
@@ -320,7 +315,7 @@ static void balanced_work_func(struct work_struct *work)
 		if (cpu < nr_cpu_ids) {
 			up = false;
 			queue_delayed_work(balanced_wq,
-						 &balanced_work, msecs_to_jiffies(up_delay));
+						 &balanced_work, up_delay);
 		} else
 			stop_load_timer();
 		break;
@@ -346,14 +341,14 @@ static void balanced_work_func(struct work_struct *work)
 			break;
 		}
 		queue_delayed_work(
-			balanced_wq, &balanced_work, msecs_to_jiffies(up_delay));
+			balanced_wq, &balanced_work, up_delay);
 		break;
 	default:
 		pr_err("%s: invalid cpuquiet balanced governor state %d\n",
 		       __func__, balanced_state);
 	}
 
-	if (!up && ((now - last_change_time) < msecs_to_jiffies(down_delay)))
+	if (!up && ((now - last_change_time) < down_delay))
 		cpu = nr_cpu_ids;
 
 	// min_cpu restriction
@@ -383,13 +378,13 @@ static int balanced_cpufreq_transition(struct notifier_block *nb,
 			if (cpu_freq >= idle_top_freq) {
 				balanced_state = UP;
 				queue_delayed_work(
-					balanced_wq, &balanced_work, msecs_to_jiffies(up_delay));
+					balanced_wq, &balanced_work, up_delay);
 				start_load_timer();
 			} else if (cpu_freq <= idle_bottom_freq) {
 				balanced_state = DOWN;
 				queue_delayed_work(
 					balanced_wq, &balanced_work,
-					msecs_to_jiffies(down_delay));
+					down_delay);
 				start_load_timer();
 			}
 			break;
@@ -397,7 +392,7 @@ static int balanced_cpufreq_transition(struct notifier_block *nb,
 			if (cpu_freq >= idle_top_freq) {
 				balanced_state = UP;
 				queue_delayed_work(
-					balanced_wq, &balanced_work, msecs_to_jiffies(up_delay));
+					balanced_wq, &balanced_work, up_delay);
 				start_load_timer();
 			}
 			break;
@@ -405,7 +400,7 @@ static int balanced_cpufreq_transition(struct notifier_block *nb,
 			if (cpu_freq <= idle_bottom_freq) {
 				balanced_state = DOWN;
 				queue_delayed_work(balanced_wq,
-					&balanced_work, msecs_to_jiffies(up_delay));
+					&balanced_work, up_delay);
 				start_load_timer();
 			}
 			break;
@@ -421,6 +416,16 @@ static int balanced_cpufreq_transition(struct notifier_block *nb,
 static struct notifier_block balanced_cpufreq_nb = {
 	.notifier_call = balanced_cpufreq_transition,
 };
+
+static void delay_callback(struct cpuquiet_attribute *attr)
+{
+	unsigned long val;
+
+	if (attr) {
+		val = (*((unsigned long *)(attr->param)));
+		(*((unsigned long *)(attr->param))) = msecs_to_jiffies(val);
+	}
+}
 
 static void core_bias_callback (struct cpuquiet_attribute *attr)
 {
@@ -441,8 +446,8 @@ CPQ_BASIC_ATTRIBUTE(idle_bottom_freq, 0644, uint);
 CPQ_BASIC_ATTRIBUTE(idle_top_freq, 0644, uint);
 CPQ_BASIC_ATTRIBUTE(load_sample_rate, 0644, uint);
 CPQ_ATTRIBUTE(core_bias, 0644, uint, core_bias_callback);
-CPQ_BASIC_ATTRIBUTE(up_delay, 0644, uint);
-CPQ_BASIC_ATTRIBUTE(down_delay, 0644, uint);
+CPQ_ATTRIBUTE(up_delay, 0644, ulong, delay_callback);
+CPQ_ATTRIBUTE(down_delay, 0644, ulong, delay_callback);
 CPQ_BASIC_ATTRIBUTE(nr_run_hysteresis, 0644, uint);
 
 static struct attribute *balanced_attributes[] = {
@@ -521,6 +526,9 @@ static int balanced_start(void)
 
 	INIT_DELAYED_WORK(&balanced_work, balanced_work_func);
 	
+	up_delay = msecs_to_jiffies(100);
+	down_delay = msecs_to_jiffies(2000);
+
 	table = cpufreq_frequency_get_table(0);
 	if (!table)
 		return -EINVAL;

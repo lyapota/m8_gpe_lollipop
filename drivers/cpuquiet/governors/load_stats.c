@@ -28,12 +28,8 @@
 // from cpuquiet_driver.c
 extern unsigned int cpq_max_cpus(void);
 extern unsigned int cpq_min_cpus(void);
-extern bool cpq_is_suspended(void);
 // from cpuquiet_driver.c
 extern unsigned int best_core_to_turn_up (void);
-//from core.c
-extern unsigned long avg_cpu_nr_running(unsigned int cpu);
-
 // from sysfs.c
 extern unsigned int gov_enabled;
 
@@ -48,19 +44,19 @@ static struct delayed_work load_stats_work;
 static struct kobject *load_stats_kobject;
 
 /* configurable parameters */
-static unsigned int sample_rate = 70;		/* msec */
+static unsigned int sample_rate = 50;		/* msec */
 static unsigned int start_delay = 20000;
 static LOAD_STATS_STATE load_stats_state;
 static struct workqueue_struct *load_stats_wq;
 
-static unsigned int load_threshold[8] = {90, 80, 80, 70, 70, 60, 60, 50};
-static unsigned int twts_threshold[8] = {70, 0, 70, 120, 70, 120, 0, 120};
+static unsigned int load_threshold[8] = {80, 70, 70, 60, 60, 50, 50, 40};
+static unsigned int twts_threshold[8] = {50, 0, 50, 50, 50, 50, 0, 50};
 
 extern unsigned int get_rq_info(void);
 
 static u64 input_boost_end_time = 0;
 static bool input_boost_running = false;
-static unsigned int input_boost_duration = 3 * 70; /* ms */
+static unsigned int input_boost_duration = 2 * 50; /* ms */
 static unsigned int input_boost_cpus = 2;
 static unsigned int input_boost_enabled = true;
 static bool input_boost_task_alive = false;
@@ -88,6 +84,21 @@ static bool io_is_busy = false;
 static bool ignore_nice = true;
 
 static DEFINE_PER_CPU(struct cpu_load_data, cpuload);
+
+struct runnables_avg_sample {
+	u64 previous_integral;
+	unsigned int avg;
+	bool integral_sampled;
+	u64 prev_timestamp;
+};
+
+static DEFINE_PER_CPU(struct runnables_avg_sample, avg_nr_sample);
+
+/* EXP = alpha in the exponential moving average.
+ * Alpha = e ^ (-sample_rate / window_size) * FIXED_1
+ * Calculated for sample_rate of 20ms, window size of 100ms
+ */
+#define EXP    1677
 
 static bool log_hotplugging = false;
 #define hotplug_info(msg...) do { \
@@ -191,6 +202,42 @@ static unsigned int report_load(void)
 	return cur_load;
 }
 
+static void update_avg_nr_runnables(void)
+{
+	unsigned int i;
+	struct runnables_avg_sample *sample;
+	u64 integral, old_integral, delta_integral, delta_time, cur_time;
+
+	for_each_online_cpu(i) {
+		sample = &per_cpu(avg_nr_sample, i);
+		integral = nr_running_integral(i);
+		old_integral = sample->previous_integral;
+		sample->previous_integral = integral;
+		cur_time = ktime_to_ns(ktime_get());
+		delta_time = cur_time - sample->prev_timestamp;
+		sample->prev_timestamp = cur_time;
+
+		if (!sample->integral_sampled) {
+			sample->integral_sampled = true;
+			/* First sample to initialize prev_integral, skip
+			 * avg calculation
+			 */
+			continue;
+		}
+
+		if (integral < old_integral) {
+			/* Overflow */
+			delta_integral = (ULLONG_MAX - old_integral) + integral;
+		} else {
+			delta_integral = integral - old_integral;
+		}
+
+		/* Calculate average for the previous sample window */
+		do_div(delta_integral, delta_time);
+		sample->avg = delta_integral;
+	}
+}
+
 static unsigned int get_lightest_loaded_cpu_n(void)
 {
 	unsigned long min_avg_runnables = ULONG_MAX;
@@ -198,8 +245,8 @@ static unsigned int get_lightest_loaded_cpu_n(void)
 	int i;
 
 	for_each_online_cpu(i) {
-		unsigned int nr_runnables = avg_cpu_nr_running(i);
-
+		struct runnables_avg_sample *s = &per_cpu(avg_nr_sample, i);
+		unsigned int nr_runnables = s->avg;
 		if (i > 0 && min_avg_runnables > nr_runnables) {
 			cpu = i;
 			min_avg_runnables = nr_runnables;
@@ -237,12 +284,13 @@ static void update_load_stats_state(void)
 	total_time += this_time;
 	load = report_load();
 	rq_depth = get_rq_info();
+	update_avg_nr_runnables();
 	nr_cpu_online = num_online_cpus();
 	load_stats_state = IDLE;
 
 	if (nr_cpu_online) {
 		index = (nr_cpu_online - 1) * 2;
-		if ((nr_cpu_online < CONFIG_NR_CPUS) && (load >= load_threshold[index])) {
+		if ((nr_cpu_online < max_cpus) && (load >= load_threshold[index])) {
 			if (total_time >= twts_threshold[index]) {
            		if (nr_cpu_online < max_cpus){
            			hotplug_info("UP load=%d total_time=%lld load_threshold[index]=%d twts_threshold[index]=%d nr_cpu_online=%d min_cpus=%d max_cpus=%d\n", load, total_time, load_threshold[index], twts_threshold[index], nr_cpu_online, min_cpus, max_cpus);
@@ -545,6 +593,9 @@ static void load_stats_device_free(void)
 {
 	hotplug_info("%s\n", __func__);
 	if (load_stats_state == DISABLED) {
+		first_call = true;
+		total_time = 0;
+		last_time = 0;	
 		load_stats_state = IDLE;
 		load_stats_work_func(NULL);
 	}
@@ -555,10 +606,12 @@ static void load_stats_touch_event(void)
 	if (!gov_enabled)
 		return;
 
-	if (!cpq_is_suspended() && input_boost_enabled && !input_boost_running){
+	if (load_stats_state == DISABLED)
+		return;
+
+	if (input_boost_enabled && !input_boost_running){
 		if (input_boost_task_alive)
 			wake_up_process(input_boost_task);
-		
 	}
 }
 
@@ -570,6 +623,7 @@ static void load_stats_stop(void)
 	if (input_boost_task_alive)
 		kthread_stop(input_boost_task);
 
+	input_boost_task_alive = false;
 	destroy_workqueue(load_stats_wq);
 	kobject_put(load_stats_kobject);
 }

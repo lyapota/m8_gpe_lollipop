@@ -30,9 +30,6 @@ extern unsigned int cpq_max_cpus(void);
 extern unsigned int cpq_min_cpus(void);
 // from cpuquiet_driver.c
 extern unsigned int best_core_to_turn_up (void);
-//from core.c
-extern unsigned long avg_nr_running(void);
-extern unsigned long avg_cpu_nr_running(unsigned int cpu);
 
 // from sysfs.c
 extern unsigned int gov_enabled;
@@ -53,13 +50,15 @@ static unsigned int sample_rate = 20;		/* msec */
 
 #define NR_FSHIFT_EXP	3
 #define NR_FSHIFT	(1 << NR_FSHIFT_EXP)
+/* avg run threads * 8 (e.g., 11 = 1.375 threads) */
+static unsigned int default_thresholds[] = {
+	10, 18, 20, UINT_MAX
+};
 
 static unsigned int nr_run_last;
 static unsigned int nr_run_hysteresis = 2;		/* 1 / 2 thread */
-/* avg run threads * 8 (e.g., 11 = 1.375 threads) */
-static unsigned int nr_run_thresholds[] = {
-	10, 18, 20, UINT_MAX
-};
+static unsigned int default_threshold_level = 4;	/* 1 / 4 thread */
+static unsigned int nr_run_thresholds[NR_CPUS];
 
 DEFINE_MUTEX(runnables_lock);
 
@@ -128,8 +127,8 @@ static unsigned int get_avg_nr_runnables(void)
 static int get_action(unsigned int nr_run)
 {
 	unsigned int nr_cpus = num_online_cpus();
-	unsigned int max_cpus = cpq_max_cpus();
-	unsigned int min_cpus = cpq_min_cpus();
+	int max_cpus = cpq_max_cpus();
+	int min_cpus = cpq_min_cpus();
 	
 	if ((nr_cpus > max_cpus || nr_run < nr_cpus) && nr_cpus >= min_cpus)
 		return -1;
@@ -165,7 +164,7 @@ static void runnables_avg_sampler(unsigned long data)
 	action = get_action(nr_run);
 	if (action != 0) {
 		wmb();
-
+		schedule_work(&runnables_work);
 	}
 }
 
@@ -200,7 +199,7 @@ static void runnables_work_func(struct work_struct *work)
 
 	action = get_action(nr_run_last);
 	if (action > 0) {
-		cpu = cpumask_next_zero(0, cpu_online_mask);
+		cpu = best_core_to_turn_up ();
 		if (cpu < nr_cpu_ids)
 			cpuquiet_wake_cpu(cpu);
 	} else if (action < 0) {
@@ -210,37 +209,58 @@ static void runnables_work_func(struct work_struct *work)
 	}
 }
 
-static ssize_t show_nr_run_thresholds(struct cpuquiet_attribute *cattr, char *buf)
-{
-	char *out = buf;
-	
-	out += sprintf(out, "%d %d %d %d\n", nr_run_thresholds[0], nr_run_thresholds[1], nr_run_thresholds[2], nr_run_thresholds[3]);
+#define MAX_BYTES 100
 
-	return out - buf;
+static ssize_t show_thresholds(struct cpuquiet_attribute *attr, char *buf)
+{
+	char buffer[MAX_BYTES];
+	unsigned int i;
+	int size = 0;
+	buffer[0] = 0;
+	for_each_possible_cpu(i) {
+		if (i == ARRAY_SIZE(nr_run_thresholds) - 1)
+			break;
+		if (size >= sizeof(buffer))
+			break;
+		size += snprintf(buffer + size, sizeof(buffer) - size,
+			 "%u->%u core threshold: %u\n",
+			  i + 1, i + 2, nr_run_thresholds[i]);
+	}
+	return snprintf(buf, sizeof(buffer), "%s", buffer);
 }
 
-static ssize_t store_nr_run_thresholds(struct cpuquiet_attribute *cattr,
+static ssize_t store_thresholds(struct cpuquiet_attribute *attr,
 					const char *buf, size_t count)
 {
-	int ret;
-	int user_nr_run_thresholds[] = { 9, 17, 25, UINT_MAX };
+	int ret, i = 0;
+	char *val, *str, input[MAX_BYTES];
+	unsigned int thresholds[CONFIG_NR_CPUS];
 	
-	ret = sscanf(buf, "%d %d %d %d", &user_nr_run_thresholds[0], &user_nr_run_thresholds[1], &user_nr_run_thresholds[2], &user_nr_run_thresholds[3]);
-
-	if (ret != 4)
+	if (!count || count >= MAX_BYTES)
 		return -EINVAL;
+	strncpy(input, buf, count);
+	input[count] = '\0';
+	str = input;
+	memcpy(thresholds, nr_run_thresholds, sizeof(nr_run_thresholds));
+	while ((val = strsep(&str, " ")) != NULL) {
+		if (*val == '\0')
+			continue;
+		if (i == ARRAY_SIZE(nr_run_thresholds) - 1)
+			break;
+		ret = kstrtouint(val, 10, &thresholds[i]);
+		if (ret)
+		return -EINVAL;
+		i++;
+	}
 
-	nr_run_thresholds[0] = user_nr_run_thresholds[0];
-	nr_run_thresholds[1] = user_nr_run_thresholds[1];
-	nr_run_thresholds[2] = user_nr_run_thresholds[2];
-	nr_run_thresholds[3] = user_nr_run_thresholds[3];
-	
+	memcpy(nr_run_thresholds, thresholds, sizeof(thresholds));
 	return count;
 }
 
 CPQ_BASIC_ATTRIBUTE(sample_rate, 0644, uint);
 CPQ_BASIC_ATTRIBUTE(nr_run_hysteresis, 0644, uint);
-CPQ_ATTRIBUTE_CUSTOM(nr_run_thresholds, 0644, show_nr_run_thresholds, store_nr_run_thresholds);
+CPQ_ATTRIBUTE_CUSTOM(nr_run_thresholds, 0644,
+			show_thresholds, store_thresholds);
 
 static struct attribute *runnables_attributes[] = {
 	&sample_rate_attr.attr,
@@ -312,7 +332,7 @@ static void runnables_stop(void)
 
 static int runnables_start(void)
 {
-	int err;
+	int err, i;
 
 	err = runnables_sysfs();
 	if (err)
@@ -322,6 +342,16 @@ static int runnables_start(void)
 
 	init_timer(&runnables_timer);
 	runnables_timer.function = runnables_avg_sampler;
+
+	for(i = 0; i < ARRAY_SIZE(nr_run_thresholds); ++i) {
+		if (i == (ARRAY_SIZE(nr_run_thresholds) - 1))
+			nr_run_thresholds[i] = UINT_MAX;
+		else if (i < ARRAY_SIZE(default_thresholds))
+			nr_run_thresholds[i] = default_thresholds[i];
+		else
+			nr_run_thresholds[i] = i + 1 +
+				NR_FSHIFT / default_threshold_level;
+	}
 
 	mutex_lock(&runnables_lock);
 	runnables_state = RUNNING;
